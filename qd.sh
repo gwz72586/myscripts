@@ -1,7 +1,7 @@
 #!/bin/bash
 
 SESSION_NAME="uploader"
-SCRIPT_URL="https://raw.githubusercontent.com/gwz72586/myscripts/main/3.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/gwz72586/myscripts/main/4.sh"
 
 # 检查 tmux 是否存在
 if ! command -v tmux &>/dev/null; then

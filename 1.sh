@@ -53,12 +53,6 @@ for REMOTE in "${SELECTED_REMOTES[@]}"; do
     while read -r PATH_LINE; do
       URL="https://data.commoncrawl.org/${PATH_LINE}"
 
-      # 准确判断是否为有效链接（允许跳转）
-      if ! curl -sI -L "$URL" | head -n 1 | grep -q "200"; then
-        echo "[${REMOTE}] ⚠️ 跳过无效链接：$URL"
-        continue
-      fi
-
       # 显示当前上传总量（高亮）
       if [[ -f "$LOGFILE" ]]; then
         LAST_LINE=$(grep "Transferred:" "$LOGFILE" | tail -n1)
@@ -98,7 +92,7 @@ wait
 echo
 echo "✅ 所有上传任务完成，开始统计上传结果..."
 
-# === Step 7: 统计汇总 ===
+# === Step 7: 上传统计 ===
 TOTAL_FILES=0
 TOTAL_SIZE=0
 

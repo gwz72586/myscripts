@@ -22,3 +22,4 @@ else
     sleep 2
     tmux attach -t "$SESSION_NAME"
 fi
+

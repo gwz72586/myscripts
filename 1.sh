@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# === 功能：自动拉取 CommonCrawl warc.paths.gz 并轮询多账号上传，每账号限 700G ===
-
 # === Step 1: 自动获取所有可用 remote ===
 ALL_REMOTES=$(rclone listremotes | sed 's/:$//')
 echo "🟢 检测到以下 remote 可用："
@@ -27,17 +25,17 @@ else
   START_LINE=1
 fi
 
-# === Step 4: 信号捕获（强制停止）===
-trap 'echo -e "\n⛔ 检测到中断，正在强制终止所有上传进程..."; pkill -P $$; exit 1' INT TERM
+# === Step 4: 信号捕获，强制中断清理所有上传任务 ===
+trap 'echo -e "\n⛔ 检测到中断，正在终止所有上传进程..."; pkill -P $$; exit 1' INT TERM
 
 # === Step 5: 下载路径列表 ===
-echo "📥 正在下载并解压路径列表..."
+echo "📥 正在下载路径列表：$CC_LIST_URL"
 curl -sL "$CC_LIST_URL" | gunzip -c > "$TMPDIR/all_paths.txt"
 TOTAL_LINES=$(wc -l < "$TMPDIR/all_paths.txt")
 echo "📄 共解析到 $TOTAL_LINES 条路径，将从第 $START_LINE 行开始分配任务..."
 echo
 
-# === Step 6: 启动每个 remote 上传任务 ===
+# === Step 6: 启动每个 remote 的上传任务 ===
 LINES_PER_REMOTE=$(( (TOTAL_LINES - START_LINE + 1) / ${#SELECTED_REMOTES[@]} + 1 ))
 TASK_INDEX=1
 CUR_LINE=$START_LINE
@@ -56,24 +54,42 @@ for REMOTE in "${SELECTED_REMOTES[@]}"; do
     COUNT=0
     while read -r PATH_LINE; do
       URL="https://data.commoncrawl.org/${PATH_LINE}"
+
+      # 跳过 404 的链接（不上传无效）
+      if ! curl -s --head "$URL" | grep -q "200 OK"; then
+        echo "[${REMOTE}] ⚠️ 跳过无效链接（404）：$URL"
+        continue
+      fi
+
+      # 实时高亮显示当前 remote 上传总量
+      if [[ -f "$LOGFILE" ]]; then
+        LAST_LINE=$(grep "Transferred:" "$LOGFILE" | tail -n1)
+        SIZE=$(echo "$LAST_LINE" | awk '{print $2,$3}')
+        echo -e "\033[1;32m📦 当前 [$REMOTE] 已上传：$SIZE / ${MAX_TRANSFER}\033[0m"
+      fi
+
       echo "[${REMOTE}] 上传：$URL"
 
       rclone copyurl "$URL" "${REMOTE}:${DEST_PATH}" \
         --auto-filename \
-        --drive-chunk-size 256M \
-        --buffer-size 256M \
+        --drive-chunk-size 512M \
+        --buffer-size 512M \
         --drive-pacer-min-sleep 10ms \
         --drive-pacer-burst 200 \
+        --tpslimit 10 \
+        --tpslimit-burst 100 \
+        --multi-thread-streams 8 \
+        --transfers 8 \
         --disable-http2 \
         --max-transfer ${MAX_TRANSFER} \
         --stats-one-line -P >> "$LOGFILE" 2>&1
 
       ((COUNT++))
-      echo "[${REMOTE}] 已上传 $COUNT 个文件"
+      echo "[${REMOTE}] ✅ 已完成 $COUNT 个文件"
 
     done < "$TASK_FILE"
 
-    echo "✅ $REMOTE 上传完成或达到 700G 限额，日志保存在 $LOGFILE"
+    echo "✅ $REMOTE 上传完成或达到上限，日志保存在 $LOGFILE"
   ) &
 
   ((CUR_LINE = END_LINE + 1))
@@ -83,7 +99,7 @@ done
 # 等待所有任务完成
 wait
 echo
-echo "✅ 全部 remote 上传完成，开始统计上传结果..."
+echo "✅ 全部上传任务完成，开始统计上传结果..."
 
 # === Step 7: 上传统计 ===
 TOTAL_FILES=0
@@ -117,4 +133,3 @@ done
 printf "\n🧮 总计上传文件数：%s 个\n" "$TOTAL_FILES"
 printf "💾 总上传数据量：%s GB\n\n" "$TOTAL_SIZE"
 echo "📂 日志目录：$TMPDIR/"
-

@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# ========== 配置 ==========
 WARC_LIST_URL="https://data.commoncrawl.org/crawl-data/CC-MAIN-2025-30/warc.paths.gz"
 DEST_PATH="/dx"
 MAX_TRANSFER="700G"
@@ -11,7 +10,6 @@ mkdir -p "$TMP_DIR" "$LOG_DIR"
 export LANG=zh_CN.UTF-8
 export LC_ALL=zh_CN.UTF-8
 
-# ========== 用户输入 ==========
 read -p "请输入每隔多少小时重复执行上传任务（输入 0 仅执行一次）: " REPEAT_INTERVAL_HOURS
 ALL_REMOTES=$(rclone listremotes | sed 's/:$//')
 echo "🟢 可用 remote："
@@ -21,12 +19,10 @@ read -p "请输入从第几行开始抓取（默认 1）: " START_LINE
 START_LINE=${START_LINE:-1}
 echo
 
-# 下载并解压链接列表
 WARC_LIST_FILE="$TMP_DIR/warc.paths"
 curl -sL "$WARC_LIST_URL" | gunzip -c > "$WARC_LIST_FILE"
 TOTAL_LINES=$(wc -l < "$WARC_LIST_FILE")
 
-# ========= 主循环 =========
 while true; do
   echo "🕓 开始上传任务（当前时间：$(date)）"
 
@@ -43,6 +39,7 @@ while true; do
     NO_PROGRESS_COUNT=0
 
     while [ "$CURRENT_LINE" -le "$TOTAL_LINES" ]; do
+      SLOW_TRIGGERED=0
       PATH_LINE=$(sed -n "${CURRENT_LINE}p" "$WARC_LIST_FILE")
       URL="https://data.commoncrawl.org/${PATH_LINE}"
       echo -e "\n[$REMOTE] 🔗 上传：$URL"
@@ -50,23 +47,28 @@ while true; do
       : > "$SPEED_LOG"
       SLOW_TIME=0
 
-      # 启动速率监控
-      (
+      monitor_speed() {
         while true; do
           SPEED=$(tail -n20 "$SPEED_LOG" | grep -oP 'Speed:\s+\K[\d\.]+(?=\sMiB/s)' | tail -n1)
-          SPEED=${SPEED:-0}; SPEED_INT=${SPEED%.*}
-          if [ "$SPEED_INT" -lt 10 ]; then SLOW_TIME=$((SLOW_TIME + 5)); else SLOW_TIME=0; fi
+          SPEED=${SPEED:-0}
+          SPEED_INT=${SPEED%.*}
+          if [ "$SPEED_INT" -lt 10 ]; then
+            SLOW_TIME=$((SLOW_TIME + 5))
+          else
+            SLOW_TIME=0
+          fi
           if [ "$SLOW_TIME" -ge 60 ]; then
-            echo "⚠️ 速率低于10MiB/s达60秒，跳过 $REMOTE" | tee -a "$LOGFILE"
+            echo "⚠️ 速率低于10MiB/s达60秒，跳过 $REMOTE"
+            SLOW_TRIGGERED=1
             kill "$UPLOAD_PID" 2>/dev/null
-            exit
+            break
           fi
           sleep 5
         done
-      ) &
-      MON_PID=$!
+      }
 
-      # 上传执行
+      monitor_speed &
+      MON_PID=$!
       rclone copyurl "$URL" "$REMOTE:$DEST_PATH" \
         --auto-filename \
         --drive-chunk-size 512M \
@@ -78,10 +80,14 @@ while true; do
         --max-transfer "$MAX_TRANSFER" \
         --stats-one-line -P >> "$SPEED_LOG" 2>&1 &
       UPLOAD_PID=$!
-      wait $UPLOAD_PID
-      kill $MON_PID 2>/dev/null
+      wait "$UPLOAD_PID"
+      kill "$MON_PID" 2>/dev/null
 
-      # 自检上传有效性（通过 used 字节判断）
+      if [ "$SLOW_TRIGGERED" -eq 1 ]; then
+        echo "🔁 跳过当前 remote，切换下一个..." | tee -a "$LOGFILE"
+        break
+      fi
+
       sleep 10
       NEW_USED=$(rclone about "$REMOTE:" --json | jq -r '.used' 2>/dev/null)
       if [ "$NEW_USED" -le "$LAST_USED" ]; then

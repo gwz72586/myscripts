@@ -1,5 +1,5 @@
 #!/bin/bash
-# ver 1.1  ── 自动上传脚本（修复低速检测和卡死问题）
+# ver 2.0  ── 自动上传脚本（修复语法错误和低速检测问题）
 
 set -euo pipefail
 
@@ -25,6 +25,8 @@ cleanup() {
     local upload_pid=${1:-}
     local mon_pid=${2:-}
     
+    echo "🧹 开始清理进程..."
+    
     # 终止监控进程
     if [[ -n "$mon_pid" ]] && kill -0 "$mon_pid" 2>/dev/null; then
         kill -TERM "$mon_pid" 2>/dev/null || true
@@ -46,9 +48,10 @@ cleanup() {
     
     # 清理可能的孤儿进程
     pkill -f "rclone copyurl.*$REMOTE:" 2>/dev/null || true
+    echo "✅ 进程清理完成"
 }
 
-read -rp "每隔多少小时重复执行上传任务（0 表示仅执行一次）: " REPEAT_INTERVAL_HOURS
+read -rp "每隔多少小时重复执行上传任务（0 表示仅执行一次）v2.0: " REPEAT_INTERVAL_HOURS
 ALL_REMOTES=$(rclone listremotes | sed 's/:$//')
 echo -e "🟢 可用 remote：\n$ALL_REMOTES"
 read -rp "请输入要使用的 remote 名称（空格分隔）： " -a SELECTED_REMOTES
@@ -58,8 +61,10 @@ echo
 
 ######################### 下载路径列表 #########################
 WARC_FILE="$TMP_DIR/warc.paths"
+echo "📥 下载WARC路径列表..."
 curl -sL "$WARC_LIST_URL" | gunzip -c > "$WARC_FILE"
 TOTAL_LINES=$(wc -l < "$WARC_FILE")
+echo "📋 总共 $TOTAL_LINES 个文件"
 
 ######################### 主循环 #########################
 while :; do
@@ -76,133 +81,53 @@ while :; do
     # 确保进度文件存在
     if [[ ! -f "$PROGRESS_FILE" ]]; then
         echo "$START_LINE" > "$PROGRESS_FILE"
+        echo "📝 创建进度文件，从第 $START_LINE 行开始"
     fi
-    CURRENT_LINE=$(<"$PROGRESS_FILE")
-    LAST_USED=$(rclone about "$REMOTE:" --json | jq -r '.used' 2>/dev/null || echo 0)
+    CURRENT_LINE=$(cat "$PROGRESS_FILE")
+    
+    LAST_USED=$(rclone about "$REMOTE:" --json 2>/dev/null | jq -r '.used' 2>/dev/null || echo 0)
     echo "$LAST_USED" > "$USED_FILE"
     NO_PROGRESS=0
 
     while [ "$CURRENT_LINE" -le "$TOTAL_LINES" ]; do
       PATH_LINE=$(sed -n "${CURRENT_LINE}p" "$WARC_FILE")
       URL="https://data.commoncrawl.org/${PATH_LINE}"
-      echo -e "\n[$REMOTE] 🔗 $URL"
+      echo -e "\n[$REMOTE] 🔗 进度: $CURRENT_LINE/$TOTAL_LINES"
+      echo "📁 文件: $(basename "$PATH_LINE")"
 
       # 重置标记和日志
       echo 0 > "$FLAG_FILE"
       : > "$SPEED_LOG"
 
-      # 针对rclone实际输出格式的速度监控函数
+      # 速度监控函数（修复语法错误）
       monitor_speed() {
         local slow_count=0
         local check_interval=5
         local no_data_count=0
-        local startup_grace=15  # 启动宽限期15秒
+        local startup_grace=15
         
         echo "🔍 开始速度监控 (阈值: ${LOW_SPEED_MB} MiB/s, 超时: ${LOW_SPEED_SECONDS}s)"
         
-        while [[ -f "$FLAG_FILE" && $(<"$FLAG_FILE") == 0 ]]; do
+        while [[ -f "$FLAG_FILE" && $(cat "$FLAG_FILE" 2>/dev/null || echo 0) == 0 ]]; do
           sleep "$check_interval"
           no_data_count=$((no_data_count + check_interval))
           
-          # 检查速度日志是否有最新内容
           if [[ -f "$SPEED_LOG" && -s "$SPEED_LOG" ]]; then
-            # 获取最后一行的完整统计信息
             local latest_line=$(tail -n 1 "$SPEED_LOG" 2>/dev/null | grep -v "^$" || echo "")
-            echo "📊 最新状态: $latest_line"
+            echo "📊 状态: $latest_line"
             
             if [[ -n "$latest_line" ]]; then
               local speed_mib=0
+              local speed_str=""
               
-              # 匹配 rclone 格式: "数字 B/s" 或 "数字 MiB/s" 等
-              # 支持: 123 B/s, 1.23 KiB/s, 12.34 MiB/s, 123.45 GiB/s
-              local speed_str=$(echo "$latest_line" | grep -oP '[\d\.]+\s*[KMGT]?i?B/s' | tail -n 1 || echo "")
+              # 提取速度字符串（支持各种格式）
+              if echo "$latest_line" | grep -q "B/s"; then
+                speed_str=$(echo "$latest_line" | grep -o '[0-9.][0-9.]*[[:space:]]*[KMGT]*i*B/s' | tail -n 1 || echo "")
+              fi
               
               if [[ -n "$speed_str" ]]; then
-                local speed_num=$(echo "$speed_str" | grep -oP '^[\d\.]+' || echo "0")
-                local speed_unit=$(echo "$speed_str" | grep -oP '[KMGT]?i?B/s
-
-      # 启动监控
-      monitor_speed & 
-      MON_PID=$!
-
-      # 启动上传，增加更详细的输出
-      echo "🚀 启动上传进程..."
-      rclone copyurl "$URL" "$REMOTE:$DEST_PATH" \
-        --auto-filename \
-        --drive-chunk-size "$CHUNK_SIZE" \
-        --buffer-size "$BUFFER_SIZE" \
-        --multi-thread-streams "$THREADS" \
-        --transfers "$THREADS" \
-        --tpslimit 0 \
-        --disable-http2 \
-        --max-transfer "$MAX_TRANSFER" \
-        --stats-one-line \
-        --stats 3s \
-        --verbose \
-        -P >> "$SPEED_LOG" 2>> "$LOGFILE" &
-      UPLOAD_PID=$!
-
-      # 等待上传完成或低速触发
-      while kill -0 "$UPLOAD_PID" 2>/dev/null; do
-        if [[ $(<"$FLAG_FILE" 2>/dev/null || echo 0) == 1 ]]; then
-          echo "🔄 低速标记触发，终止当前上传"
-          break
-        fi
-        sleep 2
-      done
-
-      # 清理进程
-      cleanup "$UPLOAD_PID" "$MON_PID"
-      
-      # 等待进程完全终止
-      sleep 3
-
-      # 检查是否因低速切换
-      if [[ $(<"$FLAG_FILE" 2>/dev/null || echo 0) == 1 ]]; then
-        echo "🔁 因低速切换到下一个 remote"
-        break
-      fi
-
-      # 检查上传是否成功
-      if ! wait "$UPLOAD_PID" 2>/dev/null; then
-        echo "❌ 上传进程异常退出" | tee -a "$LOGFILE"
-      fi
-
-      # 验证上传效果
-      sleep 10
-      NEW_USED=$(rclone about "$REMOTE:" --json | jq -r '.used' 2>/dev/null || echo 0)
-      if (( NEW_USED <= LAST_USED )); then
-        NO_PROGRESS=$((NO_PROGRESS+1))
-        echo "❌ 无空间增量 ($NO_PROGRESS/3)" | tee -a "$LOGFILE"
-      else
-        echo "✅ 上传有效: $(( (NEW_USED - LAST_USED) / 1024 / 1024 )) MB" | tee -a "$LOGFILE"
-        NO_PROGRESS=0
-        echo "$NEW_USED" > "$USED_FILE"
-        LAST_USED=$NEW_USED
-      fi
-      
-      # 连续失败则切换
-      if (( NO_PROGRESS >= 3 )); then
-        echo "🚫 连续 3 次无增量，切换 remote"
-        break
-      fi
-
-      CURRENT_LINE=$((CURRENT_LINE + 1))
-      echo "$CURRENT_LINE" > "$PROGRESS_FILE"
-    done
-    
-    # 清理临时文件
-    rm -f "$FLAG_FILE" "$SPEED_LOG"
-  done
-
-  if (( REPEAT_INTERVAL_HOURS == 0 )); then
-    echo -e "\n✅ 单次任务完成，退出"
-    exit 0
-  fi
-  
-  echo -e "\n🕙 本轮结束，休眠 ${REPEAT_INTERVAL_HOURS}h..."
-  sleep $(( REPEAT_INTERVAL_HOURS * 3600 ))
-done || echo "B/s")
+                local speed_num=$(echo "$speed_str" | grep -o '^[0-9.][0-9.]*' || echo "0")
+                local speed_unit=$(echo "$speed_str" | grep -o '[KMGT]*i*B/s$' || echo "B/s")
                 
                 # 转换到 MiB/s
                 case "$speed_unit" in
@@ -229,34 +154,36 @@ done || echo "B/s")
                     ;;
                 esac
                 
-                local speed_int=$(echo "$speed_mib" | cut -d. -f1)
+                local speed_int=${speed_mib%.*}
                 speed_int=${speed_int:-0}
                 
-                echo "📈 当前速度: ${speed_mib} MiB/s (原始: $speed_str)"
+                echo "📈 速度: ${speed_mib} MiB/s (原始: $speed_str)"
                 
-                # 启动宽限期内不检测低速
+                # 启动宽限期
                 if (( no_data_count <= startup_grace )); then
                   echo "🚀 启动宽限期: ${no_data_count}/${startup_grace}s"
                   continue
                 fi
                 
+                # 检测低速
                 if (( speed_int < LOW_SPEED_MB )); then
                   slow_count=$((slow_count + check_interval))
-                  echo "⚠️ 低速警告: ${speed_mib} MiB/s < ${LOW_SPEED_MB} MiB/s (累计: ${slow_count}/${LOW_SPEED_SECONDS}s)"
+                  echo "⚠️ 低速: ${speed_mib} MiB/s < ${LOW_SPEED_MB} MiB/s (累计: ${slow_count}/${LOW_SPEED_SECONDS}s)"
                 else
                   if (( slow_count > 0 )); then
-                    echo "✅ 速度恢复: ${speed_mib} MiB/s >= ${LOW_SPEED_MB} MiB/s"
+                    echo "✅ 速度恢复: ${speed_mib} MiB/s"
                   fi
                   slow_count=0
                 fi
                 
+                # 触发切换
                 if (( slow_count >= LOW_SPEED_SECONDS )); then
-                  echo "🐌 触发低速切换: 连续 ${LOW_SPEED_SECONDS}s < ${LOW_SPEED_MB} MiB/s"
+                  echo "🐌 触发低速切换！"
                   echo 1 > "$FLAG_FILE"
                   return
                 fi
               else
-                echo "⏳ 未找到速度信息... (${no_data_count}s)"
+                echo "⏳ 等待速度数据... (${no_data_count}s)"
               fi
             else
               echo "📝 等待日志输出... (${no_data_count}s)"
@@ -265,9 +192,9 @@ done || echo "B/s")
             echo "📂 等待日志文件... (${no_data_count}s)"
           fi
           
-          # 如果超过2分钟没有有效速度数据，可能是连接问题
+          # 超时保护
           if (( no_data_count >= 120 )); then
-            echo "❌ 长时间无有效数据，可能连接异常，切换remote"
+            echo "❌ 超时，切换remote"
             echo 1 > "$FLAG_FILE"
             return
           fi
@@ -278,7 +205,7 @@ done || echo "B/s")
       monitor_speed & 
       MON_PID=$!
 
-      # 启动上传，增加更详细的输出
+      # 启动上传
       echo "🚀 启动上传进程..."
       rclone copyurl "$URL" "$REMOTE:$DEST_PATH" \
         --auto-filename \
@@ -297,7 +224,8 @@ done || echo "B/s")
 
       # 等待上传完成或低速触发
       while kill -0 "$UPLOAD_PID" 2>/dev/null; do
-        if [[ $(<"$FLAG_FILE" 2>/dev/null || echo 0) == 1 ]]; then
+        local flag_value=$(cat "$FLAG_FILE" 2>/dev/null || echo 0)
+        if [[ "$flag_value" == "1" ]]; then
           echo "🔄 低速标记触发，终止当前上传"
           break
         fi
@@ -306,29 +234,29 @@ done || echo "B/s")
 
       # 清理进程
       cleanup "$UPLOAD_PID" "$MON_PID"
-      
-      # 等待进程完全终止
       sleep 3
 
       # 检查是否因低速切换
-      if [[ $(<"$FLAG_FILE" 2>/dev/null || echo 0) == 1 ]]; then
+      local final_flag=$(cat "$FLAG_FILE" 2>/dev/null || echo 0)
+      if [[ "$final_flag" == "1" ]]; then
         echo "🔁 因低速切换到下一个 remote"
         break
       fi
 
-      # 检查上传是否成功
+      # 检查上传结果
       if ! wait "$UPLOAD_PID" 2>/dev/null; then
         echo "❌ 上传进程异常退出" | tee -a "$LOGFILE"
       fi
 
       # 验证上传效果
       sleep 10
-      NEW_USED=$(rclone about "$REMOTE:" --json | jq -r '.used' 2>/dev/null || echo 0)
+      NEW_USED=$(rclone about "$REMOTE:" --json 2>/dev/null | jq -r '.used' 2>/dev/null || echo 0)
       if (( NEW_USED <= LAST_USED )); then
         NO_PROGRESS=$((NO_PROGRESS+1))
         echo "❌ 无空间增量 ($NO_PROGRESS/3)" | tee -a "$LOGFILE"
       else
-        echo "✅ 上传有效: $(( (NEW_USED - LAST_USED) / 1024 / 1024 )) MB" | tee -a "$LOGFILE"
+        local size_diff=$(( (NEW_USED - LAST_USED) / 1024 / 1024 ))
+        echo "✅ 上传成功: ${size_diff} MB" | tee -a "$LOGFILE"
         NO_PROGRESS=0
         echo "$NEW_USED" > "$USED_FILE"
         LAST_USED=$NEW_USED

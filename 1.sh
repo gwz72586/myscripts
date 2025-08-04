@@ -19,28 +19,38 @@ DEST_PATH="/dx/"
 TMPDIR=".cc_log"
 mkdir -p "$TMPDIR"
 
-# === Step 3: 下载路径列表 ===
+# === Step 3: 选择抓取起始行 ===
+read -p "请输入从第几行开始抓取路径（默认 1）: " INPUT_START_LINE
+if [[ "$INPUT_START_LINE" =~ ^[0-9]+$ ]] && [ "$INPUT_START_LINE" -ge 1 ]]; then
+  START_LINE=$INPUT_START_LINE
+else
+  START_LINE=1
+fi
+
+# === Step 4: 信号捕获（强制停止）===
+trap 'echo -e "\n⛔ 检测到中断，正在强制终止所有上传进程..."; pkill -P $$; exit 1' INT TERM
+
+# === Step 5: 下载路径列表 ===
 echo "📥 正在下载并解压路径列表..."
 curl -sL "$CC_LIST_URL" | gunzip -c > "$TMPDIR/all_paths.txt"
 TOTAL_LINES=$(wc -l < "$TMPDIR/all_paths.txt")
-
-echo "📄 共解析到 $TOTAL_LINES 条路径，准备分配上传任务..."
+echo "📄 共解析到 $TOTAL_LINES 条路径，将从第 $START_LINE 行开始分配任务..."
 echo
 
-# === Step 4: 启动每个 remote 上传任务 ===
-LINES_PER_REMOTE=$(( TOTAL_LINES / ${#SELECTED_REMOTES[@]} + 1 ))
-START_LINE=1
+# === Step 6: 启动每个 remote 上传任务 ===
+LINES_PER_REMOTE=$(( (TOTAL_LINES - START_LINE + 1) / ${#SELECTED_REMOTES[@]} + 1 ))
 TASK_INDEX=1
+CUR_LINE=$START_LINE
 
 for REMOTE in "${SELECTED_REMOTES[@]}"; do
-  END_LINE=$(( START_LINE + LINES_PER_REMOTE - 1 ))
+  END_LINE=$(( CUR_LINE + LINES_PER_REMOTE - 1 ))
   TASK_FILE="${TMPDIR}/task_${REMOTE}.txt"
   LOGFILE="${TMPDIR}/${REMOTE}.log"
 
   # 提取任务路径
-  sed -n "${START_LINE},${END_LINE}p" "$TMPDIR/all_paths.txt" > "$TASK_FILE"
+  sed -n "${CUR_LINE},${END_LINE}p" "$TMPDIR/all_paths.txt" > "$TASK_FILE"
 
-  echo "🚀 启动 $REMOTE 上传任务（第 $START_LINE ~ $END_LINE 行）..."
+  echo "🚀 启动 $REMOTE 上传任务（第 $CUR_LINE ~ $END_LINE 行）..."
   
   (
     COUNT=0
@@ -66,15 +76,16 @@ for REMOTE in "${SELECTED_REMOTES[@]}"; do
     echo "✅ $REMOTE 上传完成或达到 700G 限额，日志保存在 $LOGFILE"
   ) &
 
-  ((START_LINE = END_LINE + 1))
+  ((CUR_LINE = END_LINE + 1))
   ((TASK_INDEX++))
 done
 
+# 等待所有任务完成
 wait
 echo
 echo "✅ 全部 remote 上传完成，开始统计上传结果..."
 
-# === Step 5: 上传统计 ===
+# === Step 7: 上传统计 ===
 TOTAL_FILES=0
 TOTAL_SIZE=0
 
@@ -84,10 +95,8 @@ printf "%-10s %-15s %-15s\n" "REMOTE" "文件数" "传输总量"
 for REMOTE in "${SELECTED_REMOTES[@]}"; do
   LOGFILE="${TMPDIR}/${REMOTE}.log"
 
-  # 文件数 = Copied 或 Checks 出现次数
   FILE_COUNT=$(grep -c -E "Copied \(new\)|Checks:" "$LOGFILE")
 
-  # 提取最后一条 Transferred 数据
   SIZE_LINE=$(grep "Transferred:" "$LOGFILE" | tail -n1 | awk '{print $2,$3}')
   
   if [[ $SIZE_LINE == *"G"* ]]; then
@@ -108,3 +117,4 @@ done
 printf "\n🧮 总计上传文件数：%s 个\n" "$TOTAL_FILES"
 printf "💾 总上传数据量：%s GB\n\n" "$TOTAL_SIZE"
 echo "📂 日志目录：$TMPDIR/"
+

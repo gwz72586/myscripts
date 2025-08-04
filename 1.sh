@@ -55,7 +55,7 @@ for REMOTE in "${SELECTED_REMOTES[@]}"; do
   (
     COUNT=0
     while read -r PATH_LINE; do
-      URL="https://data.commoncrawl.org/CC-MAIN-2025-30/${PATH_LINE}"
+      URL="https://data.commoncrawl.org/${PATH_LINE}"
       echo "[${REMOTE}] 上传：$URL"
 
       rclone copyurl "$URL" "${REMOTE}:${DEST_PATH}" \

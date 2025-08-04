@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# === Step 1: 自动获取所有可用 remote ===
+# === Step 1: 获取可用 remote 并让用户选择 ===
 ALL_REMOTES=$(rclone listremotes | sed 's/:$//')
 echo "🟢 检测到以下 remote 可用："
 echo "$ALL_REMOTES"
@@ -9,15 +9,14 @@ read -p "请输入你希望使用的 remote 名称（以空格分隔，例如：
 echo "✅ 你选择的 remote 有：${SELECTED_REMOTES[*]}"
 echo
 
-# === Step 2: 配置 ===
+# === Step 2: 配置参数 ===
 CC_LIST_URL="https://data.commoncrawl.org/crawl-data/CC-MAIN-2025-30/warc.paths.gz"
 MAX_TRANSFER="700G"
-THREADS=6
 DEST_PATH="/dx/"
 TMPDIR=".cc_log"
 mkdir -p "$TMPDIR"
 
-# === Step 3: 选择抓取起始行 ===
+# === Step 3: 输入起始行 ===
 read -p "请输入从第几行开始抓取路径（默认 1）: " INPUT_START_LINE
 if [[ "$INPUT_START_LINE" =~ ^[0-9]+$ ]] && [ "$INPUT_START_LINE" -ge 1 ]]; then
   START_LINE=$INPUT_START_LINE
@@ -25,43 +24,42 @@ else
   START_LINE=1
 fi
 
-# === Step 4: 信号捕获，强制中断清理所有上传任务 ===
+# === Step 4: 强制终止处理 ===
 trap 'echo -e "\n⛔ 检测到中断，正在终止所有上传进程..."; pkill -P $$; exit 1' INT TERM
 
-# === Step 5: 下载路径列表 ===
-echo "📥 正在下载路径列表：$CC_LIST_URL"
+# === Step 5: 下载 warc.paths.gz ===
+echo "📥 正在下载并解压路径列表..."
 curl -sL "$CC_LIST_URL" | gunzip -c > "$TMPDIR/all_paths.txt"
 TOTAL_LINES=$(wc -l < "$TMPDIR/all_paths.txt")
 echo "📄 共解析到 $TOTAL_LINES 条路径，将从第 $START_LINE 行开始分配任务..."
 echo
 
-# === Step 6: 启动每个 remote 的上传任务 ===
+# === Step 6: 启动上传任务 ===
 LINES_PER_REMOTE=$(( (TOTAL_LINES - START_LINE + 1) / ${#SELECTED_REMOTES[@]} + 1 ))
-TASK_INDEX=1
 CUR_LINE=$START_LINE
+TASK_INDEX=1
 
 for REMOTE in "${SELECTED_REMOTES[@]}"; do
   END_LINE=$(( CUR_LINE + LINES_PER_REMOTE - 1 ))
   TASK_FILE="${TMPDIR}/task_${REMOTE}.txt"
   LOGFILE="${TMPDIR}/${REMOTE}.log"
 
-  # 提取任务路径
   sed -n "${CUR_LINE},${END_LINE}p" "$TMPDIR/all_paths.txt" > "$TASK_FILE"
 
   echo "🚀 启动 $REMOTE 上传任务（第 $CUR_LINE ~ $END_LINE 行）..."
-  
+
   (
     COUNT=0
     while read -r PATH_LINE; do
       URL="https://data.commoncrawl.org/${PATH_LINE}"
 
-      # 跳过 404 的链接（不上传无效）
-      if ! curl -s --head "$URL" | grep -q "200 OK"; then
-        echo "[${REMOTE}] ⚠️ 跳过无效链接（404）：$URL"
+      # 准确判断是否为有效链接（允许跳转）
+      if ! curl -sI -L "$URL" | head -n 1 | grep -q "200"; then
+        echo "[${REMOTE}] ⚠️ 跳过无效链接：$URL"
         continue
       fi
 
-      # 实时高亮显示当前 remote 上传总量
+      # 显示当前上传总量（高亮）
       if [[ -f "$LOGFILE" ]]; then
         LAST_LINE=$(grep "Transferred:" "$LOGFILE" | tail -n1)
         SIZE=$(echo "$LAST_LINE" | awk '{print $2,$3}')
@@ -89,19 +87,18 @@ for REMOTE in "${SELECTED_REMOTES[@]}"; do
 
     done < "$TASK_FILE"
 
-    echo "✅ $REMOTE 上传完成或达到上限，日志保存在 $LOGFILE"
+    echo "✅ $REMOTE 上传任务完成，日志保存在 $LOGFILE"
   ) &
 
   ((CUR_LINE = END_LINE + 1))
   ((TASK_INDEX++))
 done
 
-# 等待所有任务完成
 wait
 echo
-echo "✅ 全部上传任务完成，开始统计上传结果..."
+echo "✅ 所有上传任务完成，开始统计上传结果..."
 
-# === Step 7: 上传统计 ===
+# === Step 7: 统计汇总 ===
 TOTAL_FILES=0
 TOTAL_SIZE=0
 

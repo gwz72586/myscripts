@@ -51,7 +51,7 @@ cleanup() {
     echo "✅ 进程清理完成"
 }
 
-read -rp "每隔多少小时重复执行上传任务（0 表示仅执行一次）v2.0: " REPEAT_INTERVAL_HOURS
+read -rp "每隔多少小时重复执行上传任务（0 v2.0表示仅执行一次）: " REPEAT_INTERVAL_HOURS
 ALL_REMOTES=$(rclone listremotes | sed 's/:$//')
 echo -e "🟢 可用 remote：\n$ALL_REMOTES"
 read -rp "请输入要使用的 remote 名称（空格分隔）： " -a SELECTED_REMOTES

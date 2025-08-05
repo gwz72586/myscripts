@@ -1,8 +1,9 @@
 #!/bin/bash
-# CC-G v9 - CommonCrawl Global Uploader (网卡速度监控版)
+# Google Drive Expander v7 - 谷歌网盘扩充器
+# Author: DX
 # ✨ 核心特性：
 #   - 直接监控网卡上传速度，简单可靠
-#   - 自动低速切换节点 (< 20MB/s 超过30秒)
+#   - 自动低速切换节点 (< 5MB/s 超过60秒)
 #   - 默认随机全选节点，25小时循环
 #   - 全新大气启动界面
 
@@ -54,7 +55,7 @@ get_main_interface() {
     fi
 }
 
-# 获取网卡上传速度 (MB/s)
+# 获取网卡上传速度 (MB/s) - 修复版
 get_network_upload_speed() {
     local interface="$1"
     local bytes_file="/sys/class/net/$interface/statistics/tx_bytes"
@@ -68,18 +69,29 @@ get_network_upload_speed() {
     local timestamp=$(date +%s)
     local speed_file="$TMP_DIR/network_speed_${interface}"
     
+    # 验证current_bytes是数字
+    if [[ ! "$current_bytes" =~ ^[0-9]+$ ]]; then
+        echo "0"
+        return
+    fi
+    
     if [[ -f "$speed_file" ]]; then
         local prev_data=($(<"$speed_file"))
-        local prev_bytes=${prev_data[0]}
-        local prev_time=${prev_data[1]}
+        local prev_bytes=${prev_data[0]:-0}
+        local prev_time=${prev_data[1]:-0}
         
-        local bytes_diff=$((current_bytes - prev_bytes))
-        local time_diff=$((timestamp - prev_time))
-        
-        if (( time_diff > 0 )); then
-            # 转换为 MB/s (1MB = 1000000 bytes)
-            local speed_mb=$((bytes_diff / time_diff / 1000000))
-            echo "$speed_mb"
+        # 验证数据有效性
+        if [[ "$prev_bytes" =~ ^[0-9]+$ ]] && [[ "$prev_time" =~ ^[0-9]+$ ]]; then
+            local bytes_diff=$((current_bytes - prev_bytes))
+            local time_diff=$((timestamp - prev_time))
+            
+            if (( time_diff > 0 && bytes_diff >= 0 )); then
+                # 转换为 MB/s (1MB = 1000000 bytes)
+                local speed_mb=$((bytes_diff / time_diff / 1000000))
+                echo "$speed_mb"
+            else
+                echo "0"
+            fi
         else
             echo "0"
         fi
@@ -91,10 +103,17 @@ get_network_upload_speed() {
     echo "$current_bytes $timestamp" > "$speed_file"
 }
 
-# 获取节点累计上传量 (GB)
+# 获取节点累计上传量 (GB) - 修复版
 get_node_total_uploaded() {
     local remote="$1"
-    local current_bytes=$(rclone size "$remote:$DEST_PATH" --json 2>/dev/null | jq -r '.bytes // 0')
+    local current_bytes=$(rclone size "$remote:$DEST_PATH" --json 2>/dev/null | jq -r '.bytes // 0' 2>/dev/null || echo "0")
+    
+    # 验证bytes是数字
+    if [[ ! "$current_bytes" =~ ^[0-9]+$ ]]; then
+        echo "0"
+        return
+    fi
+    
     # 转换为 GB (1GB = 1073741824 bytes)
     local gb=$((current_bytes / 1073741824))
     echo "$gb"
@@ -150,14 +169,15 @@ show_banner() {
     cat << 'EOF'
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                                                                              ║
-║    ██████╗ ██████╗        ██████╗     ██╗   ██╗ █████╗                      ║
-║   ██╔════╝██╔════╝       ██╔════╝     ██║   ██║██╔══██╗                     ║
-║   ██║     ██║     █████╗ ██║  ███╗    ██║   ██║╚██████║                     ║
-║   ██║     ██║     ╚════╝ ██║   ██║    ╚██╗ ██╔╝ ╚═══██║                     ║
-║   ╚██████╗╚██████╗       ╚██████╔╝     ╚████╔╝  █████╔╝                     ║
-║    ╚═════╝ ╚═════╝        ╚═════╝       ╚═══╝   ╚════╝                      ║
+║   ██████╗  ██████╗  ██████╗  ██████╗ ██╗     ███████╗    ██████╗ ██╗  ██╗   ║
+║  ██╔════╝ ██╔═══██╗██╔═══██╗██╔════╝ ██║     ██╔════╝    ██╔══██╗╚██╗██╔╝   ║
+║  ██║  ███╗██║   ██║██║   ██║██║  ███╗██║     █████╗      ██║  ██║ ╚███╔╝    ║
+║  ██║   ██║██║   ██║██║   ██║██║   ██║██║     ██╔══╝      ██║  ██║ ██╔██╗    ║
+║  ╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝███████╗███████╗    ██████╔╝██╔╝ ██╗   ║
+║   ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝ ╚══════╝╚══════╝    ╚═════╝ ╚═╝  ╚═╝   ║
 ║                                                                              ║
-║              🌍 COMMONCRAWL GLOBAL UPLOADER v9.0 🌍                         ║
+║              🌍 GOOGLE DRIVE EXPANDER v7.0 - DX 🌍                          ║
+║                       谷歌网盘扩充器                                            ║
 ║                                                                              ║
 ║                     🚀 网卡速度监控 • 智能节点切换                               ║
 ║                     ⚡ 2.5Gbps优化 • 全自动化部署                              ║
@@ -198,6 +218,9 @@ echo -e "\033[38;5;226m🌐 网络接口\033[0m: $MAIN_INTERFACE ($INTERFACE_IP)
 
 # 测试网卡速度读取
 TEST_SPEED=$(get_network_upload_speed "$MAIN_INTERFACE")
+# 确保速度值是数字
+TEST_SPEED=${TEST_SPEED//[^0-9]/}
+TEST_SPEED=${TEST_SPEED:-0}
 echo "   └─ 初始上传速度: ${TEST_SPEED}MB/s"
 
 # 默认设置
@@ -301,10 +324,20 @@ while :; do
                     check_count=$((check_count+1))
                     
                     local speed=$(get_network_upload_speed "$MAIN_INTERFACE")
-                    local active_threads=$(pgrep -cf "rclone.*$REMOTE:" || echo 0)
+                    local active_threads=$(pgrep -cf "rclone.*$REMOTE:" 2>/dev/null || echo 0)
                     local total_uploaded=$(get_node_total_uploaded "$REMOTE")
                     
-                    printf "\r├─ 📊 网卡速度: %d MB/s | 活跃线程: %d | 已上传: %dGB" "$speed" "$active_threads" "$total_uploaded"
+                    # 确保所有变量都是纯数字
+                    speed=${speed//[^0-9]/}
+                    active_threads=${active_threads//[^0-9]/}
+                    total_uploaded=${total_uploaded//[^0-9]/}
+                    
+                    # 设置默认值
+                    speed=${speed:-0}
+                    active_threads=${active_threads:-0}
+                    total_uploaded=${total_uploaded:-0}
+                    
+                    printf "\r├─ 📊 网卡速度: %s MB/s | 活跃线程: %s | 已上传: %sGB" "$speed" "$active_threads" "$total_uploaded"
                     
                     # 前60秒不检测低速
                     if (( check_count <= 12 )); then
@@ -321,12 +354,13 @@ while :; do
                     if (( slow_count >= LOW_SPEED_SECONDS )); then
                         echo -e "\n├─ 🐌 网卡低速触发: ${speed}MB/s < ${LOW_SPEED_MB}MB/s (持续${LOW_SPEED_SECONDS}秒)"
                         echo 1 > "$FLAG_FILE"
+                        # 立即退出监控循环
                         return
                     fi
                     
                     # 超时检测 (10分钟)
                     if (( check_count >= 120 )); then
-                        echo -e "\n├─ ⏰ 超时切换"
+                        echo -e "\n├─ ⏰ 批次超时，自动切换"
                         echo 1 > "$FLAG_FILE"
                         return
                     fi
@@ -365,6 +399,7 @@ while :; do
             echo "├─ ⚡ 共 ${#UPLOAD_PIDS[@]} 线程，网卡监控已启动"
 
             ##### 等待上传完成或低速触发 #####
+            timeout_count=0
             while :; do
                 [[ $(<"$FLAG_FILE") == 1 ]] && {
                     echo -e "\n├─ 🛑 低速中止批次，正在终止进程..."
@@ -386,6 +421,17 @@ while :; do
                 done
                 
                 (( alive == 0 )) && break
+                
+                # 防止无限等待
+                timeout_count=$((timeout_count+1))
+                if (( timeout_count > 200 )); then  # 超过10分钟强制退出
+                    echo -e "\n├─ ⚠️ 等待超时，强制终止所有进程"
+                    for p in "${UPLOAD_PIDS[@]}"; do
+                        kill -KILL "$p" 2>/dev/null || true
+                    done
+                    break
+                fi
+                
                 sleep 3
             done
 
@@ -393,6 +439,10 @@ while :; do
 
             ##### 批次统计 #####
             FINAL_SPEED=$(get_network_upload_speed "$MAIN_INTERFACE")
+            # 确保速度值是数字
+            FINAL_SPEED=${FINAL_SPEED//[^0-9]/}
+            FINAL_SPEED=${FINAL_SPEED:-0}
+            
             NEW_USED=$(verify_batch "$LAST_USED")
             verify_ok=$?
             size_diff_gb=$(echo "scale=2; ($NEW_USED - $LAST_USED) / 1073741824" | bc -l)

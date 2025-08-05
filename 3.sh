@@ -1,4 +1,8 @@
-#!/bin/bash
+# 获取活跃进程数
+get_active_count() {
+    local remote="$1"
+    pgrep -c -f "rclone.*$remote:" 2>/dev/null || echo "0"
+}#!/bin/bash
 # Google Drive Expander v7 - 谷歌网盘扩充器
 # Author: DX
 # ✨ 核心特性：
@@ -33,10 +37,13 @@ mkdir -p "$TMP_DIR" "$LOG_DIR"
 export LANG=zh_CN.UTF-8
 export LC_ALL=zh_CN.UTF-8
 
+# 调试模式（设置为1启用调试输出）
+DEBUG_MODE=${DEBUG_MODE:-0}
+
 ###################### 调试和日志函数 ######################
 debug_log() {
     local msg="$1"
-    echo "[DEBUG $(date '+%H:%M:%S')] $msg" >&2
+    [[ "$DEBUG_MODE" == "1" ]] && echo "[DEBUG $(date '+%H:%M:%S')] $msg" >&2
 }
 
 error_log() {
@@ -45,14 +52,40 @@ error_log() {
 }
 
 ###################### 网卡监控函数（简化重写） ######################
+# 重置网卡监控
+reset_network_monitor() {
+    local interface="$1"
+    local speed_file="$TMP_DIR/net_${interface}.tmp"
+    
+    # 清理旧数据
+    rm -f "$speed_file"
+    debug_log "重置网卡监控: $interface"
+    
+    # 立即获取一次基准数据
+    local stats_line=$(grep "$interface:" /proc/net/dev 2>/dev/null | head -1)
+    if [[ -n "$stats_line" ]]; then
+        local current_bytes=$(echo "$stats_line" | awk '{print $10}')
+        local current_time=$(date +%s)
+        if [[ "$current_bytes" =~ ^[0-9]+$ ]]; then
+            echo "$current_bytes $current_time" > "$speed_file"
+            debug_log "网卡监控初始化完成，基准字节数: $current_bytes"
+        else
+            debug_log "获取网卡基准数据失败"
+        fi
+    else
+        debug_log "网卡 $interface 不存在"
+    fi
+}
+
 # 使用 vnstat 或 iftop 风格的简单监控
 get_network_speed_simple() {
     local interface="$1"
     local speed_file="$TMP_DIR/net_${interface}.tmp"
     
     # 使用 cat /proc/net/dev 获取网络统计
-    local stats_line=$(grep "$interface:" /proc/net/dev 2>/dev/null || echo "")
+    local stats_line=$(grep "$interface:" /proc/net/dev 2>/dev/null | head -1)
     if [[ -z "$stats_line" ]]; then
+        debug_log "网卡 $interface 在 /proc/net/dev 中未找到"
         echo "0"
         return
     fi
@@ -62,6 +95,7 @@ get_network_speed_simple() {
     local current_time=$(date +%s)
     
     if [[ ! "$current_bytes" =~ ^[0-9]+$ ]]; then
+        debug_log "无效的字节数: $current_bytes"
         echo "0"
         return
     fi
@@ -76,31 +110,28 @@ get_network_speed_simple() {
             local time_diff=$((current_time - prev_time))
             local bytes_diff=$((current_bytes - prev_bytes))
             
+            debug_log "速度计算: 字节差=$bytes_diff, 时间差=$time_diff"
+            
             if (( time_diff >= 5 && bytes_diff >= 0 )); then
                 # 计算MB/s
                 local speed_mb=$((bytes_diff / time_diff / 1048576))
+                debug_log "计算速度: ${speed_mb}MB/s"
                 echo "$speed_mb"
             else
+                debug_log "时间差或字节差无效"
                 echo "0"
             fi
         else
+            debug_log "历史数据无效"
             echo "0"
         fi
     else
+        debug_log "无历史数据，返回0"
         echo "0"
     fi
     
     # 保存当前数据
     echo "$current_bytes $current_time" > "$speed_file"
-}
-
-# 重置网卡监控
-reset_network_monitor() {
-    local interface="$1"
-    rm -f "$TMP_DIR/net_${interface}.tmp"
-    # 等待一个周期后初始化
-    sleep 6
-    get_network_speed_simple "$interface" > /dev/null
 }
 
 # 获取主要网卡接口
@@ -122,67 +153,62 @@ get_main_interface() {
     fi
 }
 
-###################### 进程管理函数 ######################
-# 获取活跃rclone进程数
-get_active_threads() {
-    local remote="$1"
-    pgrep -cf "rclone.*$remote:" 2>/dev/null || echo "0"
-}
-
-# 强制终止所有相关进程
-force_kill_processes() {
-    local remote="$1"
-    local pids=($(pgrep -f "rclone.*$remote:" 2>/dev/null || true))
-    
-    if [[ ${#pids[@]} -gt 0 ]]; then
-        debug_log "终止 ${#pids[@]} 个rclone进程"
-        for pid in "${pids[@]}"; do
-            kill -TERM "$pid" 2>/dev/null || true
-        done
-        sleep 3
-        
-        # 强制杀死顽固进程
-        for pid in "${pids[@]}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                kill -KILL "$pid" 2>/dev/null || true
-            fi
-        done
-    fi
-}
-
-# 安全的进程等待函数
-wait_for_processes() {
+###################### 进程管理函数（简化重写） ######################
+# 简单的进程等待（防卡死版）
+simple_wait_processes() {
     local -a pids=("$@")
-    local timeout_count=0
-    local max_timeout=200  # 10分钟
+    local wait_count=0
+    local max_wait=120  # 最多等待6分钟
     
-    while (( timeout_count < max_timeout )); do
+    while (( wait_count < max_wait )); do
         local alive=0
+        
         for pid in "${pids[@]}"; do
-            if kill -0 "$pid" 2>/dev/null; then
+            if ps -p "$pid" > /dev/null 2>&1; then
                 alive=$((alive+1))
             fi
         done
         
         if (( alive == 0 )); then
-            debug_log "所有进程已完成"
+            echo -e "\n├─ ✅ 所有进程完成"
             return 0
         fi
         
-        # 每30秒输出调试信息
-        if (( timeout_count % 10 == 0 && timeout_count > 0 )); then
-            debug_log "等待进程完成... 剩余: $alive 个"
+        # 每分钟输出一次状态
+        if (( wait_count % 20 == 0 && wait_count > 0 )); then
+            echo -e "\n├─ ⏳ 等待中... 剩余 $alive 个进程"
         fi
         
-        timeout_count=$((timeout_count+1))
+        wait_count=$((wait_count+1))
         sleep 3
     done
     
-    error_log "进程等待超时，强制终止"
+    # 超时强制终止
+    echo -e "\n├─ ⚠️ 等待超时，强制终止"
     for pid in "${pids[@]}"; do
-        kill -KILL "$pid" 2>/dev/null || true
+        kill -9 "$pid" 2>/dev/null || true
     done
+    sleep 2
     return 1
+}
+
+# 简单的进程清理
+simple_cleanup() {
+    local remote="$1"
+    echo "├─ 🧹 清理进程..."
+    
+    # 获取所有相关进程
+    local pids=($(pgrep -f "rclone.*$remote:" 2>/dev/null || true))
+    
+    if [[ ${#pids[@]} -gt 0 ]]; then
+        for pid in "${pids[@]}"; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+        sleep 2
+        echo "├─ ✅ 清理完成"
+    else
+        echo "├─ ✅ 无需清理"
+    fi
 }
 
 ###################### 存储管理函数 ######################
@@ -269,16 +295,19 @@ fi
 INTERFACE_IP=$(ip addr show "$MAIN_INTERFACE" | grep 'inet ' | awk '{print $2}' | head -1)
 echo -e "\033[38;5;226m🌐 网络接口\033[0m: $MAIN_INTERFACE ($INTERFACE_IP)"
 
-# 初始化网卡监控
-if ! init_network_monitor "$MAIN_INTERFACE"; then
-    error_log "网卡监控初始化失败"
-    exit 1
+# 测试网卡监控
+echo "   └─ 正在初始化网卡监控..."
+echo "   └─ 网卡统计文件: /proc/net/dev"
+if grep -q "$MAIN_INTERFACE:" /proc/net/dev; then
+    echo "   └─ 网卡监控就绪"
+    # 初始化网卡监控
+    reset_network_monitor "$MAIN_INTERFACE"
+else
+    echo "   └─ ⚠️ 网卡在 /proc/net/dev 中未找到"
+    echo "   └─ 可用网卡列表:"
+    cat /proc/net/dev | grep ":" | awk -F: '{print "       " $1}' | sed 's/^ *//'
 fi
-
-# 测试网卡速度
-sleep 2  # 等待一下再测试
-TEST_SPEED=$(get_network_speed "$MAIN_INTERFACE")
-echo "   └─ 初始上传速度: ${TEST_SPEED}MB/s"
+echo "   💡 如需调试模式，运行: DEBUG_MODE=1 $0"
 
 # 用户交互
 DEFAULT_REPEAT=25
@@ -346,13 +375,12 @@ while true; do
         # 文件和状态管理
         PROGRESS_FILE="$TMP_DIR/${REMOTE}.progress"
         LOGFILE="$LOG_DIR/${REMOTE}_$(date +%F_%H-%M-%S).log"
-        FLAG_FILE="$TMP_DIR/${REMOTE}_flag"
         
         [[ -f "$PROGRESS_FILE" ]] || echo "$START_LINE" > "$PROGRESS_FILE"
         CURRENT_LINE=$(<"$PROGRESS_FILE")
         
         # 重新初始化网卡监控
-        init_network_monitor "$MAIN_INTERFACE"
+        reset_network_monitor "$MAIN_INTERFACE"
         
         # 获取初始存储量
         LAST_STORAGE=$(get_node_storage "$REMOTE")
@@ -370,61 +398,6 @@ while true; do
             BATCH_URLS="$TMP_DIR/${REMOTE}_urls_${CURRENT_LINE}.txt"
             sed -n "${CURRENT_LINE},${BATCH_END}p" "$WARC_FILE" | \
                 sed "s|^|https://data.commoncrawl.org/|" > "$BATCH_URLS"
-            
-            # 初始化标志
-            echo "0" > "$FLAG_FILE"
-            
-            # 启动网卡监控
-            monitor_network() {
-                local slow_count=0
-                local check_count=0
-                
-                while [[ $(<"$FLAG_FILE") == "0" ]]; do
-                    sleep $MONITOR_INTERVAL
-                    check_count=$((check_count+1))
-                    
-                    local speed=$(get_network_speed "$MAIN_INTERFACE")
-                    local active=$(get_active_threads "$REMOTE")
-                    local storage_gb=$(($(get_node_storage "$REMOTE") / 1073741824))
-                    
-                    # 确保都是数字
-                    [[ ! "$speed" =~ ^[0-9]+$ ]] && speed=0
-                    [[ ! "$active" =~ ^[0-9]+$ ]] && active=0
-                    [[ ! "$storage_gb" =~ ^[0-9]+$ ]] && storage_gb=0
-                    
-                    printf "\r├─ 📊 网卡: %dMB/s | 线程: %d | 存储: %dGB" "$speed" "$active" "$storage_gb"
-                    
-                    # 前60秒不检测
-                    if (( check_count <= 12 )); then
-                        continue
-                    fi
-                    
-                    # 低速检测
-                    if (( speed < LOW_SPEED_MB )); then
-                        slow_count=$((slow_count + MONITOR_INTERVAL))
-                    else
-                        slow_count=0
-                    fi
-                    
-                    # 触发低速切换
-                    if (( slow_count >= LOW_SPEED_SECONDS )); then
-                        echo -e "\n├─ 🐌 低速触发: ${speed}MB/s < ${LOW_SPEED_MB}MB/s"
-                        echo "1" > "$FLAG_FILE"
-                        return
-                    fi
-                    
-                    # 批次超时
-                    if (( check_count * MONITOR_INTERVAL >= BATCH_TIMEOUT )); then
-                        echo -e "\n├─ ⏰ 批次超时"
-                        echo "1" > "$FLAG_FILE"
-                        return
-                    fi
-                done
-            }
-            
-            # 启动监控
-            monitor_network &
-            MONITOR_PID=$!
             
             # 启动上传进程
             UPLOAD_PIDS=()
@@ -451,25 +424,75 @@ while true; do
                 UPLOAD_PIDS+=("$!")
                 idx=$((idx+1))
                 echo "├─ 🔗 线程 $idx: ${filename:0:35}..."
-                sleep 0.2
+                sleep 0.1
             done < "$BATCH_URLS"
             
             echo "├─ ⚡ 启动 ${#UPLOAD_PIDS[@]} 个上传线程"
             
-            # 等待完成或中断
-            if [[ $(<"$FLAG_FILE") == "1" ]]; then
-                echo -e "\n├─ 🛑 监控触发，终止批次"
-                force_kill_processes "$REMOTE"
-            else
-                echo -e "\n├─ ⏳ 等待批次完成..."
-                wait_for_processes "${UPLOAD_PIDS[@]}"
+            # 简化的监控循环（主线程）
+            local monitor_count=0
+            local slow_count=0
+            local low_speed_triggered=false
+            
+            while true; do
+                # 检查进程状态
+                local alive=0
+                for pid in "${UPLOAD_PIDS[@]}"; do
+                    if ps -p "$pid" > /dev/null 2>&1; then
+                        alive=$((alive+1))
+                    fi
+                done
+                
+                # 如果所有进程完成，退出监控
+                if (( alive == 0 )); then
+                    echo -e "\n├─ ✅ 所有进程完成"
+                    break
+                fi
+                
+                # 获取监控数据
+                local speed=$(get_network_speed_simple "$MAIN_INTERFACE")
+                local storage_gb=$(($(get_node_storage "$REMOTE") / 1073741824))
+                
+                # 确保是数字
+                [[ ! "$speed" =~ ^[0-9]+$ ]] && speed=0
+                [[ ! "$storage_gb" =~ ^[0-9]+$ ]] && storage_gb=0
+                
+                printf "\r├─ 📊 网卡: %dMB/s | 线程: %d | 存储: %dGB" "$speed" "$alive" "$storage_gb"
+                
+                monitor_count=$((monitor_count+1))
+                
+                # 前60秒不检测低速
+                if (( monitor_count > 12 )); then
+                    if (( speed < LOW_SPEED_MB )); then
+                        slow_count=$((slow_count+5))
+                    else
+                        slow_count=0
+                    fi
+                    
+                    # 低速触发
+                    if (( slow_count >= LOW_SPEED_SECONDS )); then
+                        echo -e "\n├─ 🐌 低速触发: ${speed}MB/s < ${LOW_SPEED_MB}MB/s"
+                        low_speed_triggered=true
+                        break
+                    fi
+                fi
+                
+                # 超时检测
+                if (( monitor_count > 120 )); then  # 10分钟
+                    echo -e "\n├─ ⏰ 批次超时"
+                    break
+                fi
+                
+                sleep 5
+            done
+            
+            # 清理进程
+            if [[ "$low_speed_triggered" == true ]] || (( monitor_count > 120 )); then
+                simple_cleanup "$REMOTE"
             fi
             
-            # 停止监控
-            kill -TERM "$MONITOR_PID" 2>/dev/null || true
-            
             # 批次统计
-            FINAL_SPEED=$(get_network_speed "$MAIN_INTERFACE")
+            FINAL_SPEED=$(get_network_speed_simple "$MAIN_INTERFACE")
             [[ ! "$FINAL_SPEED" =~ ^[0-9]+$ ]] && FINAL_SPEED=0
             
             NEW_STORAGE=$(verify_batch_completion "$REMOTE" "$LAST_STORAGE")
@@ -497,7 +520,6 @@ while true; do
         done
         
         # 清理
-        rm -f "$FLAG_FILE"
         echo -e "└─ ✅ 节点 \033[38;5;82m$REMOTE\033[0m 完成"
     done
     

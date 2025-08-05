@@ -19,8 +19,8 @@ CHUNK_SIZE="256M"
 BUFFER_SIZE="2G"
 MULTI_THREAD_STREAMS=8
 CHECKERS=32
-LOW_SPEED_MB=20        # 低于 20 MB/s
-LOW_SPEED_SECONDS=30   # 持续 30 秒判为低速
+LOW_SPEED_MB=5         # 低于 5 MB/s
+LOW_SPEED_SECONDS=60   # 持续 60 秒判为低速
 
 TMP_DIR="/tmp/warc_uploader"
 LOG_DIR="./logs"
@@ -91,6 +91,15 @@ get_network_upload_speed() {
     echo "$current_bytes $timestamp" > "$speed_file"
 }
 
+# 获取节点累计上传量 (GB)
+get_node_total_uploaded() {
+    local remote="$1"
+    local current_bytes=$(rclone size "$remote:$DEST_PATH" --json 2>/dev/null | jq -r '.bytes // 0')
+    # 转换为 GB (1GB = 1073741824 bytes)
+    local gb=$((current_bytes / 1073741824))
+    echo "$gb"
+}
+
 cleanup() {
     local mon_pid=${1:-}
     [[ -n "$mon_pid" && $(kill -0 "$mon_pid" 2>/dev/null || echo 0) ]] && {
@@ -98,7 +107,24 @@ cleanup() {
         sleep 1
         kill -KILL "$mon_pid" 2>/dev/null || true
     }
-    pkill -f "rclone copyurl.*$REMOTE:" 2>/dev/null || true
+    
+    # 强制终止所有相关rclone进程
+    local pids=($(pgrep -f "rclone copyurl.*$REMOTE:" 2>/dev/null || true))
+    for pid in "${pids[@]}"; do
+        [[ -n "$pid" ]] && {
+            kill -TERM "$pid" 2>/dev/null || true
+        }
+    done
+    
+    # 等待进程终止
+    sleep 2
+    
+    # 强制杀死顽固进程
+    for pid in "${pids[@]}"; do
+        [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && {
+            kill -KILL "$pid" 2>/dev/null || true
+        }
+    done
 }
 
 # 批次容量验证
@@ -151,6 +177,12 @@ EOF
 
 ###################### 用户交互 ######################
 show_banner
+
+# 检查依赖
+if ! command -v bc &> /dev/null; then
+    echo "❌ 需要安装 bc 计算器: sudo apt install bc"
+    exit 1
+fi
 
 # 获取网卡信息
 MAIN_INTERFACE=$(get_main_interface)
@@ -270,11 +302,12 @@ while :; do
                     
                     local speed=$(get_network_upload_speed "$MAIN_INTERFACE")
                     local active_threads=$(pgrep -cf "rclone.*$REMOTE:" || echo 0)
+                    local total_uploaded=$(get_node_total_uploaded "$REMOTE")
                     
-                    printf "\r├─ 📊 网卡速度: %d MB/s | 活跃线程: %d" "$speed" "$active_threads"
+                    printf "\r├─ 📊 网卡速度: %d MB/s | 活跃线程: %d | 已上传: %dGB" "$speed" "$active_threads" "$total_uploaded"
                     
-                    # 前30秒不检测低速
-                    if (( check_count <= 6 )); then
+                    # 前60秒不检测低速
+                    if (( check_count <= 12 )); then
                         continue
                     fi
                     
@@ -286,7 +319,7 @@ while :; do
                     fi
                     
                     if (( slow_count >= LOW_SPEED_SECONDS )); then
-                        echo -e "\n├─ 🐌 网卡低速触发: ${speed}MB/s < ${LOW_SPEED_MB}MB/s"
+                        echo -e "\n├─ 🐌 网卡低速触发: ${speed}MB/s < ${LOW_SPEED_MB}MB/s (持续${LOW_SPEED_SECONDS}秒)"
                         echo 1 > "$FLAG_FILE"
                         return
                     fi
@@ -334,10 +367,16 @@ while :; do
             ##### 等待上传完成或低速触发 #####
             while :; do
                 [[ $(<"$FLAG_FILE") == 1 ]] && {
-                    echo -e "\n├─ 🛑 低速中止批次"
+                    echo -e "\n├─ 🛑 低速中止批次，正在终止进程..."
+                    
+                    # 立即终止所有上传进程
                     for p in "${UPLOAD_PIDS[@]}"; do
-                        kill -TERM "$p" 2>/dev/null || true
+                        kill -KILL "$p" 2>/dev/null || true
                     done
+                    
+                    # 等待进程清理
+                    sleep 3
+                    echo "├─ ✅ 进程清理完成"
                     break
                 }
                 
@@ -356,10 +395,10 @@ while :; do
             FINAL_SPEED=$(get_network_upload_speed "$MAIN_INTERFACE")
             NEW_USED=$(verify_batch "$LAST_USED")
             verify_ok=$?
-            size_diff=$(( (NEW_USED - LAST_USED)/1024/1024 ))
+            size_diff_gb=$(echo "scale=2; ($NEW_USED - $LAST_USED) / 1073741824" | bc -l)
             
             if (( verify_ok == 0 )); then
-                echo -e "\n├─ ✅ 批次完成 | 新增 ${size_diff}MB | 网卡速度 ${FINAL_SPEED}MB/s"
+                echo -e "\n├─ ✅ 批次完成 | 新增 ${size_diff_gb}GB | 网卡速度 ${FINAL_SPEED}MB/s"
                 LAST_USED=$NEW_USED
                 NO_PROGRESS=0
             else

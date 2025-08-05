@@ -65,20 +65,24 @@ get_network_upload_speed() {
         return
     fi
     
-    local current_bytes=$(<"$bytes_file")
+    local current_bytes
+    current_bytes=$(<"$bytes_file" 2>/dev/null) || { echo "0"; return; }
+    
     local timestamp=$(date +%s)
     local speed_file="$TMP_DIR/network_speed_${interface}"
     
-    # 验证current_bytes是数字
+    # 验证current_bytes是纯数字
     if [[ ! "$current_bytes" =~ ^[0-9]+$ ]]; then
         echo "0"
         return
     fi
     
     if [[ -f "$speed_file" ]]; then
-        local prev_data=($(<"$speed_file"))
-        local prev_bytes=${prev_data[0]:-0}
-        local prev_time=${prev_data[1]:-0}
+        local prev_line
+        prev_line=$(<"$speed_file" 2>/dev/null) || { echo "0"; return; }
+        
+        local prev_bytes prev_time
+        read -r prev_bytes prev_time <<< "$prev_line"
         
         # 验证数据有效性
         if [[ "$prev_bytes" =~ ^[0-9]+$ ]] && [[ "$prev_time" =~ ^[0-9]+$ ]]; then
@@ -106,15 +110,18 @@ get_network_upload_speed() {
 # 获取节点累计上传量 (GB) - 修复版
 get_node_total_uploaded() {
     local remote="$1"
-    local current_bytes=$(rclone size "$remote:$DEST_PATH" --json 2>/dev/null | jq -r '.bytes // 0' 2>/dev/null || echo "0")
+    local current_bytes
     
-    # 验证bytes是数字
+    # 使用超时和错误处理
+    current_bytes=$(timeout 10 rclone size "$remote:$DEST_PATH" --json 2>/dev/null | jq -r '.bytes // 0' 2>/dev/null)
+    
+    # 如果获取失败或不是数字，返回0
     if [[ ! "$current_bytes" =~ ^[0-9]+$ ]]; then
         echo "0"
         return
     fi
     
-    # 转换为 GB (1GB = 1073741824 bytes)
+    # 转换为 GB (1GB = 1073741824 bytes) 
     local gb=$((current_bytes / 1073741824))
     echo "$gb"
 }
@@ -218,9 +225,10 @@ echo -e "\033[38;5;226m🌐 网络接口\033[0m: $MAIN_INTERFACE ($INTERFACE_IP)
 
 # 测试网卡速度读取
 TEST_SPEED=$(get_network_upload_speed "$MAIN_INTERFACE")
-# 确保速度值是数字
-TEST_SPEED=${TEST_SPEED//[^0-9]/}
-TEST_SPEED=${TEST_SPEED:-0}
+# 确保速度值是纯数字
+if [[ ! "$TEST_SPEED" =~ ^[0-9]+$ ]]; then
+    TEST_SPEED=0
+fi
 echo "   └─ 初始上传速度: ${TEST_SPEED}MB/s"
 
 # 默认设置
@@ -324,18 +332,13 @@ while :; do
                     check_count=$((check_count+1))
                     
                     local speed=$(get_network_upload_speed "$MAIN_INTERFACE")
-                    local active_threads=$(pgrep -cf "rclone.*$REMOTE:" 2>/dev/null || echo 0)
+                    local active_threads=$(pgrep -cf "rclone.*$REMOTE:" 2>/dev/null | head -1)
                     local total_uploaded=$(get_node_total_uploaded "$REMOTE")
                     
-                    # 确保所有变量都是纯数字
-                    speed=${speed//[^0-9]/}
-                    active_threads=${active_threads//[^0-9]/}
-                    total_uploaded=${total_uploaded//[^0-9]/}
-                    
-                    # 设置默认值
-                    speed=${speed:-0}
-                    active_threads=${active_threads:-0}
-                    total_uploaded=${total_uploaded:-0}
+                    # 清理和验证变量
+                    if [[ ! "$speed" =~ ^[0-9]+$ ]]; then speed=0; fi
+                    if [[ ! "$active_threads" =~ ^[0-9]+$ ]]; then active_threads=0; fi  
+                    if [[ ! "$total_uploaded" =~ ^[0-9]+$ ]]; then total_uploaded=0; fi
                     
                     printf "\r├─ 📊 网卡速度: %s MB/s | 活跃线程: %s | 已上传: %sGB" "$speed" "$active_threads" "$total_uploaded"
                     
@@ -345,7 +348,7 @@ while :; do
                     fi
                     
                     # 低速检测
-                    if (( speed < LOW_SPEED_MB )); then
+                    if [[ "$speed" =~ ^[0-9]+$ ]] && (( speed < LOW_SPEED_MB )); then
                         slow_count=$((slow_count+5))
                     else
                         slow_count=0
@@ -401,6 +404,7 @@ while :; do
             ##### 等待上传完成或低速触发 #####
             timeout_count=0
             while :; do
+                # 检查低速标志
                 [[ $(<"$FLAG_FILE") == 1 ]] && {
                     echo -e "\n├─ 🛑 低速中止批次，正在终止进程..."
                     
@@ -415,12 +419,19 @@ while :; do
                     break
                 }
                 
+                # 检查存活进程数
                 alive=0
                 for p in "${UPLOAD_PIDS[@]}"; do
-                    kill -0 "$p" 2>/dev/null && alive=$((alive+1))
+                    if kill -0 "$p" 2>/dev/null; then
+                        alive=$((alive+1))
+                    fi
                 done
                 
-                (( alive == 0 )) && break
+                # 如果没有存活进程，退出循环
+                if (( alive == 0 )); then
+                    echo -e "\n├─ ✅ 所有线程已完成"
+                    break
+                fi
                 
                 # 防止无限等待
                 timeout_count=$((timeout_count+1))
@@ -429,7 +440,14 @@ while :; do
                     for p in "${UPLOAD_PIDS[@]}"; do
                         kill -KILL "$p" 2>/dev/null || true
                     done
+                    sleep 2
+                    echo "├─ 🔄 继续下一批次"
                     break
+                fi
+                
+                # 每30秒输出一次调试信息
+                if (( timeout_count % 10 == 0 )); then
+                    echo -e "\n├─ 🔍 等待进程完成... 剩余: $alive 个进程"
                 fi
                 
                 sleep 3
@@ -439,13 +457,14 @@ while :; do
 
             ##### 批次统计 #####
             FINAL_SPEED=$(get_network_upload_speed "$MAIN_INTERFACE")
-            # 确保速度值是数字
-            FINAL_SPEED=${FINAL_SPEED//[^0-9]/}
-            FINAL_SPEED=${FINAL_SPEED:-0}
+            # 确保速度值是纯数字
+            if [[ ! "$FINAL_SPEED" =~ ^[0-9]+$ ]]; then
+                FINAL_SPEED=0
+            fi
             
             NEW_USED=$(verify_batch "$LAST_USED")
             verify_ok=$?
-            size_diff_gb=$(echo "scale=2; ($NEW_USED - $LAST_USED) / 1073741824" | bc -l)
+            size_diff_gb=$(echo "scale=2; ($NEW_USED - $LAST_USED) / 1073741824" | bc -l 2>/dev/null || echo "0")
             
             if (( verify_ok == 0 )); then
                 echo -e "\n├─ ✅ 批次完成 | 新增 ${size_diff_gb}GB | 网卡速度 ${FINAL_SPEED}MB/s"

@@ -82,13 +82,30 @@ get_network_speed_simple() {
     local interface="$1"
     local speed_file="$TMP_DIR/net_${interface}.tmp"
     
-    # 使用 cat /proc/net/dev 获取网络统计
-    local stats_line=$(grep "$interface:" /proc/net/dev 2>/dev/null | head -1)
+    # 针对容器环境，尝试多种格式匹配
+    local stats_line=""
+    
+    # 尝试精确匹配
+    stats_line=$(grep "^[ ]*${interface}:" /proc/net/dev 2>/dev/null | head -1)
+    
+    # 如果没找到，尝试容器格式 eth0@ifXX
+    if [[ -z "$stats_line" ]]; then
+        stats_line=$(grep "^[ ]*${interface}@" /proc/net/dev 2>/dev/null | head -1)
+    fi
+    
+    # 还没找到，尝试模糊匹配
+    if [[ -z "$stats_line" ]]; then
+        stats_line=$(grep "${interface}" /proc/net/dev 2>/dev/null | head -1)
+    fi
+    
     if [[ -z "$stats_line" ]]; then
         debug_log "网卡 $interface 在 /proc/net/dev 中未找到"
+        debug_log "/proc/net/dev 内容: $(cat /proc/net/dev | grep -v "Inter-" | grep -v "face")"
         echo "0"
         return
     fi
+    
+    debug_log "找到网卡行: $stats_line"
     
     # 提取发送字节数（第10列）
     local current_bytes=$(echo "$stats_line" | awk '{print $10}')
@@ -118,11 +135,11 @@ get_network_speed_simple() {
                 debug_log "计算速度: ${speed_mb}MB/s"
                 echo "$speed_mb"
             else
-                debug_log "时间差或字节差无效"
+                debug_log "时间差或字节差无效 (时间=$time_diff, 字节=$bytes_diff)"
                 echo "0"
             fi
         else
-            debug_log "历史数据无效"
+            debug_log "历史数据无效: prev_bytes=$prev_bytes, prev_time=$prev_time"
             echo "0"
         fi
     else
@@ -136,21 +153,33 @@ get_network_speed_simple() {
 
 # 获取主要网卡接口
 get_main_interface() {
+    # 先尝试从路由表获取
     local interface=$(ip route | grep '^default' | awk '{print $5}' | head -1)
-    interface=${interface%%@*}  # 处理容器环境
     
-    if [[ -d "/sys/class/net/$interface" ]]; then
-        echo "$interface"
-    else
-        # 备用方案
-        for iface in /sys/class/net/*; do
-            local name=$(basename "$iface")
-            [[ "$name" != "lo" ]] && [[ -f "$iface/statistics/tx_bytes" ]] && {
-                echo "$name"
-                return
-            }
-        done
+    # 处理容器环境的接口名称 (如 eth0@if20)
+    local clean_interface=${interface%%@*}
+    
+    # 验证接口是否存在于 /proc/net/dev
+    if grep -q "^[ ]*${clean_interface}[@:]" /proc/net/dev; then
+        echo "$clean_interface"
+        return
     fi
+    
+    # 如果原始名称存在，也试试
+    if [[ -n "$interface" ]] && grep -q "^[ ]*${interface}:" /proc/net/dev; then
+        echo "$interface"
+        return
+    fi
+    
+    # 备用方案：查找第一个非lo接口
+    local first_interface=$(grep -v "lo:" /proc/net/dev | grep ":" | head -1 | awk -F: '{print $1}' | sed 's/^ *//')
+    if [[ -n "$first_interface" ]]; then
+        echo "$first_interface"
+        return
+    fi
+    
+    # 都失败了，返回空
+    echo ""
 }
 
 ###################### 进程管理函数（简化重写） ######################

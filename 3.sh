@@ -61,19 +61,36 @@ reset_network_monitor() {
     rm -f "$speed_file"
     debug_log "重置网卡监控: $interface"
     
-    # 立即获取一次基准数据
-    local stats_line=$(grep "$interface:" /proc/net/dev 2>/dev/null | head -1)
+    # 针对容器环境，尝试多种格式匹配
+    local stats_line=""
+    
+    # 尝试精确匹配
+    stats_line=$(grep "^[ ]*${interface}:" /proc/net/dev 2>/dev/null | head -1)
+    
+    # 如果没找到，尝试容器格式 eth0@ifXX
+    if [[ -z "$stats_line" ]]; then
+        stats_line=$(grep "^[ ]*${interface}@" /proc/net/dev 2>/dev/null | head -1)
+    fi
+    
+    # 还没找到，尝试模糊匹配
+    if [[ -z "$stats_line" ]]; then
+        stats_line=$(grep "${interface}" /proc/net/dev 2>/dev/null | head -1)
+    fi
+    
     if [[ -n "$stats_line" ]]; then
         local current_bytes=$(echo "$stats_line" | awk '{print $10}')
         local current_time=$(date +%s)
         if [[ "$current_bytes" =~ ^[0-9]+$ ]]; then
             echo "$current_bytes $current_time" > "$speed_file"
             debug_log "网卡监控初始化完成，基准字节数: $current_bytes"
+            debug_log "使用网卡行: $stats_line"
         else
-            debug_log "获取网卡基准数据失败"
+            debug_log "获取网卡基准数据失败，字节数无效: $current_bytes"
         fi
     else
-        debug_log "网卡 $interface 不存在"
+        debug_log "网卡 $interface 不存在于 /proc/net/dev"
+        debug_log "/proc/net/dev 内容:"
+        debug_log "$(cat /proc/net/dev)"
     fi
 }
 
@@ -327,14 +344,31 @@ echo -e "\033[38;5;226m🌐 网络接口\033[0m: $MAIN_INTERFACE ($INTERFACE_IP)
 # 测试网卡监控
 echo "   └─ 正在初始化网卡监控..."
 echo "   └─ 网卡统计文件: /proc/net/dev"
-if grep -q "$MAIN_INTERFACE:" /proc/net/dev; then
+
+# 检查网卡是否存在（支持容器格式）
+network_found=false
+
+# 尝试多种匹配方式
+if grep -q "^[ ]*${MAIN_INTERFACE}:" /proc/net/dev; then
+    network_found=true
+    debug_log "找到网卡: ${MAIN_INTERFACE}: (精确匹配)"
+elif grep -q "^[ ]*${MAIN_INTERFACE}@" /proc/net/dev; then
+    network_found=true
+    debug_log "找到网卡: ${MAIN_INTERFACE}@... (容器格式)"
+elif grep -q "${MAIN_INTERFACE}" /proc/net/dev; then
+    network_found=true
+    debug_log "找到网卡: ${MAIN_INTERFACE} (模糊匹配)"
+fi
+
+if [[ "$network_found" == true ]]; then
     echo "   └─ 网卡监控就绪"
     # 初始化网卡监控
     reset_network_monitor "$MAIN_INTERFACE"
 else
-    echo "   └─ ⚠️ 网卡在 /proc/net/dev 中未找到"
+    echo "   └─ ⚠️ 网卡 $MAIN_INTERFACE 在 /proc/net/dev 中未找到"
     echo "   └─ 可用网卡列表:"
-    cat /proc/net/dev | grep ":" | awk -F: '{print "       " $1}' | sed 's/^ *//'
+    cat /proc/net/dev | grep ":" | grep -v "Inter-" | grep -v "face" | awk -F: '{print "       " $1}' | sed 's/^ *//'
+    echo "   └─ 尝试启用调试模式查看详细信息: DEBUG_MODE=1 $0"
 fi
 echo "   💡 如需调试模式，运行: DEBUG_MODE=1 $0"
 

@@ -9,14 +9,14 @@ DEST_PATH="/dx"
 MAX_TRANSFER="700G"
 
 # 7G内存安全配置
-MAX_CONCURRENT=16      # 最大并发（适配7G内存）
+MAX_CONCURRENT=8      # 最大并发（适配7G内存）
 BUFFER_SIZE="128M"     # 安全缓存大小（128M×16=2G总缓存）
 CHUNK_SIZE="256M"      # 分块大小
 MULTI_THREAD_STREAMS=4 # 每进程流数（减少内存使用）
 CHECKERS=16            # 检查器数量
 
 # 简化的动态管理
-MIN_CONCURRENT=8       # 最小保持并发
+MIN_CONCURRENT=7     # 最小保持并发
 REFILL_THRESHOLD=4     # 补充阈值
 
 # 监控配置
